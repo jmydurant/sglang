@@ -895,6 +895,54 @@ class ForwardBatch:
 
         return prefix_chunk_starts, prefix_chunk_seq_lens
 
+    # for example if we have 5 seq with prefix length [10, 20, 30, 40, 50], prefix_chunk_len = 8
+    # num_prefix_chunks = cdiv((ceil(10 / 8) + ceil(20 / 8) + ceil(30 / 8) + ceil(40 / 8) + ceil(50 / 8)), 5) = 5
+    # prefix_chunk_start = [[0, 0, 0, 0, 0],
+    #                       [(8 + 1), (8 + 8 + 4), 0, 0, 0],
+    #                       [0, 0, (8 + 8 + 8 + 6), (8), 0],
+    #                       [0, 0, 0, (8 + 8 + 8 + 8 + 8), (8)],
+    #                       [0, 0, 0, 0, (8 + 8 + 8 + 8 + 8 + 8)]]
+    # prefix_chunk_seq_lens = [[(8 + 2), (8 + 8 + 4), 0, 0, 0],
+    #                          [0, 0, (8 + 8 + 8 + 6), (8), 0],
+    #                          [0, 0, 0, (8 + 8 + 8 + 8), (8)],
+    #                          [0, 0, 0, 0, (8 + 8 + 8 + 8 + 8)],
+    #                          [0, 0, 0, 0, (2)]]
+    # it need less num_prefix_chunks. if we use get_prefix_chunk_seq_lens, it will need cdiv(50, 8) = 7
+    def get_prefix_chunk_seq_lens_dense(
+            self, prefix_lens_cuda: torch.Tensor, prefix_lens_cpu: torch.Tensor, num_prefix_chunks: int, prefix_chunk_len: int):
+        cuda_device = prefix_lens_cuda.device
+        # total space is batch * chunk_len
+        batch_size = prefix_lens_cuda.shape[0]
+        # old_num_prefix_chunks = (prefix_lens_cpu.max().item() + prefix_chunk_len - 1) // prefix_chunk_len
+        real_num_prefix_chunks = (int(prefix_lens_cpu.div(prefix_chunk_len).ceil().sum().item()) + batch_size - 1) // batch_size
+
+        prefix_chunk_starts = torch.zeros([real_num_prefix_chunks, batch_size], dtype=torch.int32, device='cpu')
+        prefix_chunk_seq_lens = torch.zeros([real_num_prefix_chunks, batch_size], dtype=torch.int32, device='cpu')
+
+        current_chunk_idx = 0
+        remain_chunk_buffer = real_num_prefix_chunks
+        for bid in range(batch_size):
+            tokens_len_need = prefix_lens_cpu[bid].item()
+            buffer_need = (tokens_len_need + prefix_chunk_len - 1) // prefix_chunk_len
+            while tokens_len_need > 0:
+                buffer_used = min(buffer_need, remain_chunk_buffer)
+                if remain_chunk_buffer >= buffer_need:
+                    prefix_chunk_seq_lens[current_chunk_idx, bid] = tokens_len_need
+                    tokens_len_need = 0
+                    buffer_need = 0
+                else:
+                    prefix_chunk_seq_lens[current_chunk_idx, bid] = remain_chunk_buffer * prefix_chunk_len
+                    tokens_len_need -=  prefix_chunk_seq_lens[current_chunk_idx, bid]
+                    buffer_need -= buffer_used
+                if current_chunk_idx + 1 < real_num_prefix_chunks:
+                    prefix_chunk_starts[current_chunk_idx + 1, bid] = prefix_chunk_starts[current_chunk_idx, bid] + prefix_chunk_seq_lens[current_chunk_idx, bid]
+                remain_chunk_buffer -= buffer_used
+                if remain_chunk_buffer <= 0:
+                    remain_chunk_buffer = real_num_prefix_chunks
+                    current_chunk_idx += 1
+
+        return prefix_chunk_starts.to(device=cuda_device), prefix_chunk_seq_lens, prefix_chunk_seq_lens.to(device=cuda_device), real_num_prefix_chunks
+
     # Called before each attention module if using chunked kv cache for prefill
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
     def prepare_chunked_prefix_cache_info(self, device: torch.device):
@@ -924,6 +972,7 @@ class ForwardBatch:
         ) // self.prefix_chunk_len
 
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
+        '''
         prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
             self.get_prefix_chunk_seq_lens(
                 self.extend_prefix_lens,
@@ -935,6 +984,16 @@ class ForwardBatch:
             torch.tensor(self.extend_prefix_lens_cpu),
             self.num_prefix_chunks,
             self.prefix_chunk_len,
+        )
+        '''
+        # If we use dense layout, we should also recompute num_prefix_chunks
+        prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cpu, prefix_chunk_seq_lens_cuda, self.num_prefix_chunks = (
+            self.get_prefix_chunk_seq_lens_dense(
+                self.extend_prefix_lens,
+                torch.tensor(self.extend_prefix_lens_cpu),
+                self.num_prefix_chunks,
+                self.prefix_chunk_len,
+            )
         )
         self.prefix_chunk_starts = prefix_chunk_starts_cuda
         self.prefix_chunk_seq_lens = prefix_chunk_seq_lens_cuda
