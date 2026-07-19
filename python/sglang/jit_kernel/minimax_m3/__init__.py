@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused Triton kernels for MiniMax-M3 on AMD ROCm (gfx94x / gfx95x).
+"""Fused Triton kernels for MiniMax-M3.
 
 Model-scoped JIT kernels (mirrors ``jit_kernel/dsv4``), split by op type:
-  * ``rmsnorm`` -- fused fp32 Gemma RMSNorm (plain + fused-add-residual)
-  * ``swiglu``  -- fused fp32 SwiGLU-OAI (split layout)
+  * ``rmsnorm`` -- AMD fused fp32 Gemma RMSNorm (plain + fused-add-residual)
+  * ``swiglu``  -- CUDA/ROCm fused fp32 SwiGLU-OAI (split layout)
 """
 
 from sglang.jit_kernel.minimax_m3.rmsnorm import (
