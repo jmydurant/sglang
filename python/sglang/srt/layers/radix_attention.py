@@ -142,10 +142,6 @@ class RadixAttention(nn.Module):
             and get_tc_piecewise_forward_context() is not None
         ):
             if kwargs.get("idx_q") is not None:
-                if is_in_breakable_cuda_graph():
-                    return get_attn_backend().forward(
-                        q, k, v, self, forward_batch, save_kv_cache, **kwargs
-                    )
                 idx_q = kwargs["idx_q"]
                 idx_k = kwargs["idx_k"]
                 idx_v = kwargs.get("idx_v")
@@ -153,7 +149,15 @@ class RadixAttention(nn.Module):
                     (q.shape[0], self.tp_q_head_num * self.v_head_dim)
                 )
                 idx_out = q.new_empty((q.shape[0], idx_q.shape[1] * idx_q.shape[2]))
-                unified_sparse_attention_with_output(
+                # Sparse prefill owns request-level metadata prepared before
+                # each replay. Keep attention at an eager BCG break so it reads
+                # the current request instead of capture-time dummy addresses.
+                sparse_attention_op = (
+                    breakable_unified_sparse_attention_with_output
+                    if is_in_breakable_cuda_graph()
+                    else unified_sparse_attention_with_output
+                )
+                sparse_attention_op(
                     q,
                     k,
                     v,
@@ -338,4 +342,7 @@ def unified_sparse_attention_with_output(
 
 breakable_unified_attention_with_output = eager_on_graph(True)(
     unified_attention_with_output
+)
+breakable_unified_sparse_attention_with_output = eager_on_graph(True)(
+    unified_sparse_attention_with_output
 )

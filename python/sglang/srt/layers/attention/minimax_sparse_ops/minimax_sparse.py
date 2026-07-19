@@ -1,9 +1,12 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from .msa import MSAPrefillMetadata
 
 from sglang.kernels.ops.attention.minimax_sparse.common.index import topk_index_reduce
 from sglang.kernels.ops.attention.minimax_sparse.common.utils import get_cu_seqblocks
@@ -67,6 +70,9 @@ def minimax_sparse_prefill(
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
     seqlens_cpu: Optional[List[int]] = None,
+    msa_prefill_metadata: Optional["MSAPrefillMetadata"] = None,
+    msa_kv_indices: Optional[torch.Tensor] = None,
+    msa_plan=None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -118,7 +124,11 @@ def minimax_sparse_prefill(
     # Step 3: Sparse attention using topk index (main head). The MSA path only
     # replaces this step; the indexer above is unchanged. MSA has no attn-sink
     # input, so keep the Triton path when sink is present.
-    if use_msa and sink is None:
+    # MSA supports these exact sparse widths. topk_index_reduce can expand the
+    # last dimension when index heads outnumber KV heads, so gate on the actual
+    # layer output rather than only the configured pre-reduction topk.
+    msa_topk_supported = topk_idx.shape[-1] in (4, 8, 16, 32)
+    if use_msa and sink is None and msa_topk_supported:
         from .msa import MSAUnavailableError, msa_sparse_prefill_main
 
         try:
@@ -134,6 +144,9 @@ def minimax_sparse_prefill(
                 prefix_lens=prefix_lens,
                 block_size_k=block_size_k,
                 sm_scale=sm_scale,
+                prefill_metadata=msa_prefill_metadata,
+                kv_indices=msa_kv_indices,
+                plan=msa_plan,
             )
         except MSAUnavailableError as err:
             _warn_msa_fallback(err)
