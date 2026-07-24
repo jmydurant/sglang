@@ -1,10 +1,9 @@
-"""torch.compile decoration helpers used by the decode-Full path under
-``--enable-torch-compile``.
+"""Shared torch.compile configuration plus decode-Full decoration helpers.
 
 ``patch_model`` wraps the model forward with ``torch.compile`` for batch
 sizes that fall in the compile bucket list and returns the raw forward
-otherwise. ``set_torch_compile_config`` flips the inductor/dynamo config
-flags expected by that path.
+otherwise. ``set_torch_compile_config`` flips the Inductor/Dynamo config
+flags shared by that path and the prefill-tc_piecewise backend.
 
 Note: the prefill-tc_piecewise path (``TcPiecewiseCudaGraphBackend``) does NOT
 use ``patch_model`` — it goes through ``compilation/compile.py``'s
@@ -76,8 +75,16 @@ def set_torch_compile_config() -> None:
     torch._inductor.config.triton.unique_kernel_names = True
     torch._inductor.config.fx_graph_cache = True
 
-    torch._dynamo.config.accumulated_cache_size_limit = 1024
-    if hasattr(torch._dynamo.config, "cache_size_limit"):
-        torch._dynamo.config.cache_size_limit = 1024
+    # PyTorch 2.11 renamed the per-code-object and accumulated cache limits to
+    # ``recompile_limit`` and ``accumulated_recompile_limit``.  Keep setting
+    # the legacy names as well so this helper works across supported versions.
+    for limit_name in (
+        "recompile_limit",
+        "cache_size_limit",
+        "accumulated_recompile_limit",
+        "accumulated_cache_size_limit",
+    ):
+        if hasattr(torch._dynamo.config, limit_name):
+            setattr(torch._dynamo.config, limit_name, 1024)
 
     monkey_patch_torch_compile()

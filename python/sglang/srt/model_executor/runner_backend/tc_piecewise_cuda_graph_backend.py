@@ -134,6 +134,18 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         dynamic_arg_dims: Optional[Any] = None,
     ) -> None:
         """Wrap language_model.model.forward with torch.compile."""
+        # Keep this import local because torch_compile_decoration imports
+        # parallel_state, while runner backends are also imported during
+        # distributed/runtime initialization.
+        from sglang.srt.compilation.torch_compile_decoration import (
+            set_torch_compile_config,
+        )
+
+        # tc_piecewise owns a torch.compile lifecycle independently of
+        # --enable-torch-compile. Initialize the shared Dynamo/Inductor knobs
+        # here so its shape-specialized graphs do not retain PyTorch's small
+        # default recompile limit.
+        set_torch_compile_config()
         install_torch_compiled(
             language_model,
             fullgraph=fullgraph,

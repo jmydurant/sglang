@@ -255,15 +255,21 @@ class CustomAllReduceV2:
         )
 
     def _can_use_graph(self) -> bool:
+        # tc_piecewise owns the enclosing subgraph capture, so CAR must use its
+        # non-GRAPH pointer mode instead of registering graph_params rows.
+        # Check that stable mode first: during the compile pass
+        # ``_graph_mode_allowed`` is False, while the later capture session
+        # sets it to True. Reading that mutable value before the tc_piecewise
+        # check makes Dynamo compile a duplicate family of size-specialized
+        # graphs even though both phases ultimately return False here.
+        if is_in_tc_piecewise_cuda_graph():
+            return False
+
         # `_graph_mode_allowed` is only set inside `capture()`, so the eager
         # hot path never reaches the cudart capture query. During capture,
         # warm-up runs execute immediately and must not consume a
         # graph_params row (it would be dereferenced before registration).
-        return (
-            self._graph_mode_allowed
-            and not is_in_tc_piecewise_cuda_graph()
-            and torch.cuda.is_current_stream_capturing()
-        )
+        return self._graph_mode_allowed and torch.cuda.is_current_stream_capturing()
 
     def _pick_algo(
         self, nbytes: int, can_use_graph: bool
