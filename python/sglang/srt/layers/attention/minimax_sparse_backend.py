@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
@@ -7,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import torch
 
 from sglang.kernels.ops.attention.minimax_sparse.common.utils import get_cu_seqblocks
+from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -27,6 +29,56 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+_MINIMAX_TRTLLM_SPARSE_WORKSPACE_BYTES = 256 * 1024 * 1024
+_MINIMAX_FUSED_TOPK_MAX_BLOCKS = 4096
+_MINIMAX_TRTLLM_SPARSE_REQUIRED_PARAMS = frozenset(
+    {
+        "backend",
+        "enable_block_sparse_attention",
+        "multi_ctas_kv_counter_buffer",
+        "out_dtype",
+        "q_len_per_req",
+    }
+)
+
+
+def _load_trtllm_sparse_decode_api():
+    """Load the FlashInfer API added by flashinfer#3955.
+
+    This is only called when the experimental backend is explicitly enabled,
+    keeping the regular MiniMax-M3 paths import-safe with older FlashInfer
+    installations.
+    """
+    try:
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+    except Exception as err:
+        raise RuntimeError(
+            "MiniMax-M3 TRTLLM sparse decode requires FlashInfer >= 0.6.16.post2"
+        ) from err
+
+    parameters = inspect.signature(trtllm_batch_decode_with_kv_cache).parameters
+    missing = _MINIMAX_TRTLLM_SPARSE_REQUIRED_PARAMS.difference(parameters)
+    if missing:
+        raise RuntimeError(
+            "Installed FlashInfer does not expose TRTLLM-GEN block-sparse "
+            f"decode parameters {sorted(missing)}. Install matching "
+            "flashinfer-python/cubin/jit-cache 0.6.16.post2 packages."
+        )
+    return trtllm_batch_decode_with_kv_cache
+
+
+def _positive_python_scale(value: Optional[float], name: str) -> float:
+    """Resolve a graph-stable per-tensor descale stored as a Python scalar."""
+    if value is None:
+        return 1.0
+    if isinstance(value, torch.Tensor):
+        raise TypeError(
+            f"MiniMax-M3 TRTLLM sparse decode requires {name} to be a Python "
+            "scalar, not a Tensor"
+        )
+    scale = float(value)
+    return scale if scale > 0.0 else 1.0
 
 
 def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
@@ -99,6 +151,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 local_tokens + self.block_size_k - 1
             ) // self.block_size_k + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
+        self.page_size = self.kv_pool.page_size
+        self.model_dtype = runner.dtype
+
+        from sglang.srt.runtime_context import get_parallel
+
+        attn_tp_size = get_parallel().attn_tp_size
+        self.num_q_heads = runner.model_config.num_attention_heads // attn_tp_size
+        self.num_kv_heads = self.kv_pool.main_pool.head_num
+        total_idx_heads = sparse_cfg["sparse_num_index_heads"]
+        idx_head_tp_size = min(attn_tp_size, total_idx_heads)
+        self.num_idx_heads = total_idx_heads // idx_head_tp_size
 
         # MSA (fmha_sm100) is SM100-only; fall back to the Triton sparse path when
         # the kernel is unavailable or its constraints don't hold.
@@ -146,25 +209,88 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
         self._msa_dec_meta = None
         if self.use_msa:
-            from sglang.srt.runtime_context import get_parallel
-
-            self.num_q_heads = (
-                runner.model_config.num_attention_heads // get_parallel().attn_tp_size
-            )
-            self.num_kv_heads = self.kv_pool.main_pool.head_num
             self._msa_nb_max = (
                 self.max_context_len + self.block_size_k - 1
             ) // self.block_size_k
             self._msa_cg: dict[int, tuple] = {}
 
-        self.page_size = self.kv_pool.page_size
-        self.use_dense_sparse_decode = (
+        dense_sparse_decode_requested = (
             envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
+        )
+        trtllm_sparse_decode_requested = (
+            envs.SGLANG_OPT_USE_MINIMAX_TRTLLM_SPARSE_DECODE.get()
+        )
+        if dense_sparse_decode_requested and trtllm_sparse_decode_requested:
+            raise ValueError(
+                "SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE and "
+                "SGLANG_OPT_USE_MINIMAX_TRTLLM_SPARSE_DECODE are mutually "
+                "exclusive"
+            )
+        self.use_dense_sparse_decode = (
+            dense_sparse_decode_requested
             and self.block_size_k % self.page_size == 0
             # _dense_sparse_main_decode calls trtllm decode with a bf16 q and
             # unit bmm scales — no fp8 handling yet (follow-up).
             and not self.fp8_attn_gemm
         )
+        self.use_trtllm_sparse_decode = False
+        self._trtllm_sparse_decode_fn = None
+        self._trtllm_sparse_workspace: Optional[torch.Tensor] = None
+        self._trtllm_sparse_multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+        if trtllm_sparse_decode_requested:
+            capability = torch.cuda.get_device_capability(runner.device)
+            unsupported = []
+            if capability not in ((10, 0), (10, 3)):
+                unsupported.append(f"compute capability {capability}")
+            if self.block_size_k != 128 or self.page_size != 128:
+                unsupported.append(
+                    f"block/page size {self.block_size_k}/{self.page_size}"
+                )
+            if self.num_kv_heads != 1 or self.num_idx_heads != 1:
+                unsupported.append(
+                    "local KV/index heads "
+                    f"{self.num_kv_heads}/{self.num_idx_heads} (expected 1/1)"
+                )
+            if self.num_q_heads <= self.num_kv_heads:
+                unsupported.append(
+                    "local Q/KV heads "
+                    f"{self.num_q_heads}/{self.num_kv_heads} "
+                    "(TRTLLM-GEN block-sparse decode requires GQA)"
+                )
+            if self.kv_pool.main_pool.head_dim != 128:
+                unsupported.append(
+                    f"head dim {self.kv_pool.main_pool.head_dim} (expected 128)"
+                )
+            if self.topk_blocks > 64:
+                unsupported.append(f"top-k {self.topk_blocks} (> 64)")
+            main_kv_dtype = self.kv_pool.main_pool.dtype
+            if main_kv_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+                unsupported.append(f"KV dtype {main_kv_dtype}")
+            if main_kv_dtype == torch.float8_e4m3fn and not self.fp8_attn_gemm:
+                unsupported.append("FP8 KV cache without FP8 attention-GEMM mode")
+            if self.model_dtype != torch.bfloat16:
+                unsupported.append(
+                    f"model/output dtype {self.model_dtype} (expected bfloat16)"
+                )
+            if unsupported:
+                raise ValueError(
+                    "MiniMax-M3 TRTLLM sparse decode was requested but this "
+                    "configuration is unsupported: " + "; ".join(unsupported)
+                )
+
+            self._trtllm_sparse_decode_fn = _load_trtllm_sparse_decode_api()
+            from sglang.srt.layers.attention.trtllm_mla_backend import (
+                make_persistent_multi_ctas_kv_counter_buffer,
+            )
+
+            self._trtllm_sparse_multi_ctas_kv_counter_buffer = (
+                make_persistent_multi_ctas_kv_counter_buffer(
+                    torch.device(runner.device),
+                    num_q_heads=runner.model_config.num_attention_heads,
+                    max_batch_size=runner.max_running_requests + 1,
+                )
+            )
+            self.use_trtllm_sparse_decode = True
         from sglang.srt.model_executor.cuda_graph_config import (
             Backend,
             Phase,
@@ -208,7 +334,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "disable speculative decoding."
             )
         self._msa_owns_decode = self._use_msa_decode and not (
-            self.use_dense_sparse_decode and self.kv_pool.main_pool.head_num == 1
+            self.use_trtllm_sparse_decode
+            or (self.use_dense_sparse_decode and self.kv_pool.main_pool.head_num == 1)
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
@@ -218,11 +345,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
         else:
             prefill_attn = "triton"
+        if self.use_trtllm_sparse_decode:
+            decode_attn = "flashinfer_trtllm_block_sparse"
+        elif self.use_dense_sparse_decode:
+            decode_attn = "flashinfer_trtllm_compact_dense"
+        elif self._use_msa_decode:
+            decode_attn = "MSA"
+        else:
+            decode_attn = "triton"
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
             f"prefill_attn={prefill_attn}, "
-            f"decode_attn={'MSA' if self._use_msa_decode else 'triton'}, "
+            f"decode_attn={decode_attn}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
             f"fp8_attn_gemm={self.fp8_attn_gemm}, "
@@ -234,6 +369,41 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "JIT-compile fmha_sm100 fp8 kernel variants (cold cache can "
                 "take minutes; compiles serialize across TP ranks)."
             )
+
+    def bind_dense_backend(self, dense_backend: AttentionBackend) -> None:
+        """Bind shared resources after the hybrid backend is assembled."""
+        self.dense_backend = dense_backend
+        if not self.use_trtllm_sparse_decode:
+            return
+
+        counter = self._trtllm_sparse_multi_ctas_kv_counter_buffer
+        assert counter is not None
+        workspace = getattr(dense_backend, "workspace_buffer", None)
+        workspace_bytes = (
+            workspace.numel() * workspace.element_size()
+            if isinstance(workspace, torch.Tensor)
+            else 0
+        )
+        workspace_usable = (
+            isinstance(workspace, torch.Tensor)
+            and workspace.dtype == torch.uint8
+            and workspace.device == counter.device
+            and workspace_bytes >= _MINIMAX_TRTLLM_SPARSE_WORKSPACE_BYTES
+        )
+        if not workspace_usable:
+            from sglang.srt.environ import envs
+            from sglang.srt.runtime_context import get_buffer
+
+            workspace_size = max(
+                _MINIMAX_TRTLLM_SPARSE_WORKSPACE_BYTES,
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+            )
+            device = counter.device
+            workspace = get_buffer(
+                "minimax_trtllm_block_sparse_workspace",
+                lambda: torch.zeros(workspace_size, dtype=torch.uint8, device=device),
+            )
+        self._trtllm_sparse_workspace = workspace
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
@@ -267,6 +437,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     else 1
                 )
             )
+        if self.use_trtllm_sparse_decode and not in_capture:
+            fused_topk_token_limit = _MINIMAX_FUSED_TOPK_MAX_BLOCKS * self.block_size_k
+            if self._max_seqlen_k > fused_topk_token_limit:
+                raise RuntimeError(
+                    "MiniMax-M3 TRTLLM sparse decode currently supports live "
+                    f"sequences up to {fused_topk_token_limit} tokens, got "
+                    f"{self._max_seqlen_k}. Disable "
+                    "SGLANG_OPT_USE_MINIMAX_TRTLLM_SPARSE_DECODE for longer "
+                    "requests."
+                )
 
         if (
             self._cache_prefill_metadata
@@ -670,6 +850,71 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             "dense sparse decode currently supports trtllm_mha only (fa3 is TODO)"
         )
 
+    def _trtllm_sparse_main_decode(
+        self,
+        q: torch.Tensor,
+        page_table: torch.Tensor,
+        real_seq_lens: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer,
+    ) -> torch.Tensor:
+        """Run MiniMax decode step 3 with native TRTLLM block sparsity.
+
+        The fused index top-k kernel emits compact physical pages in ascending
+        logical order. With one local KV head, its ``[B, K]``/``[B]`` output is
+        already the head-major layout required by flashinfer#3955; adding the
+        leading head dimension is therefore a view and launches no metadata op.
+        """
+        run = self._trtllm_sparse_decode_fn
+        workspace = self._trtllm_sparse_workspace
+        counter = self._trtllm_sparse_multi_ctas_kv_counter_buffer
+        if run is None or workspace is None or counter is None:
+            raise RuntimeError(
+                "MiniMax-M3 TRTLLM sparse decode resources were not initialized"
+            )
+
+        batch_size = q.shape[0]
+        if page_table.shape[0] != batch_size or real_seq_lens.shape != (batch_size,):
+            raise RuntimeError(
+                "Unexpected fused sparse metadata shapes: "
+                f"page_table={tuple(page_table.shape)}, "
+                f"seq_lens={tuple(real_seq_lens.shape)}, batch={batch_size}"
+            )
+
+        head_dim = q.shape[-1]
+        k_cache_hnd = k_cache.view(-1, self.page_size, 1, head_dim).permute(0, 2, 1, 3)
+        v_cache_hnd = v_cache.view(-1, self.page_size, 1, head_dim).permute(0, 2, 1, 3)
+        k_cache_hnd = canonicalize_stride(k_cache_hnd)
+        v_cache_hnd = canonicalize_stride(v_cache_hnd)
+
+        if self.fp8_attn_gemm:
+            q_scale = _positive_python_scale(layer.q_scale_float, "q_scale")
+            k_scale = _positive_python_scale(layer.k_scale_float, "k_scale")
+            v_scale = _positive_python_scale(layer.v_scale_float, "v_scale")
+            bmm1_scale = q_scale * k_scale * layer.scaling
+            bmm2_scale = v_scale
+        else:
+            bmm1_scale = layer.scaling
+            bmm2_scale = 1.0
+
+        return run(
+            query=q,
+            kv_cache=(k_cache_hnd, v_cache_hnd),
+            workspace_buffer=workspace,
+            block_tables=page_table.view(1, batch_size, -1),
+            seq_lens=real_seq_lens.view(1, batch_size),
+            max_seq_len=self.topk_blocks * self.block_size_k,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out_dtype=self.model_dtype,
+            kv_layout="HND",
+            backend="trtllm-gen",
+            q_len_per_req=1,
+            multi_ctas_kv_counter_buffer=counter,
+            enable_block_sparse_attention=True,
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -706,7 +951,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
         attn_fn = None
-        if self.use_dense_sparse_decode and k_cache.shape[1] == 1:
+        if self.use_trtllm_sparse_decode:
+
+            def attn_fn(main_q, page_table, real_seq_lens):
+                return self._trtllm_sparse_main_decode(
+                    main_q,
+                    page_table,
+                    real_seq_lens,
+                    k_cache,
+                    v_cache,
+                    layer,
+                )
+
+        elif self.use_dense_sparse_decode and k_cache.shape[1] == 1:
 
             def attn_fn(main_q, page_table, real_seq_lens):
                 return self._dense_sparse_main_decode(
@@ -785,7 +1042,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.dense = dense_backend
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
-        self.sparse.dense_backend = dense_backend
+        self.sparse.bind_dense_backend(dense_backend)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata(forward_batch)
