@@ -1574,7 +1574,10 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     _handle_moe_kernel_config (before the deprecated cutlass env override, so
     the runner value observed is the pre-override one)."""
     runner = view.moe_runner_backend
-    if runner == "flashinfer_cutedsl":
+    if runner in (
+        "flashinfer_cutedsl",
+        "flashinfer_sm12x_nvfp4",
+    ):
         logger.warning(
             "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
         )

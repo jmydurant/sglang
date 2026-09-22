@@ -145,6 +145,9 @@ class _MoeRunnerBackendPredicates:
     def is_flashinfer_cutedsl(self):
         return self.value == MoeRunnerBackend.FLASHINFER_CUTEDSL.value
 
+    def is_flashinfer_sm12x_nvfp4(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_SM12X_NVFP4.value
+
     def is_flashinfer_megamoe(self):
         return self.value == MoeRunnerBackend.FLASHINFER_MEGAMOE.value
 
@@ -188,6 +191,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_SM12X_NVFP4 = "flashinfer_sm12x_nvfp4"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
@@ -375,6 +379,7 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
     if (
         get_moe_runner_backend().is_flashinfer_cutedsl()
+        or get_moe_runner_backend().is_flashinfer_sm12x_nvfp4()
         or get_moe_runner_backend().is_cutlass()
         or get_moe_runner_backend().is_humming()
     ):

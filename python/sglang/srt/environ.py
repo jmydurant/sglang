@@ -1040,6 +1040,10 @@ class Envs:
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights.
     SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
+    # Disable only for the experimentally verified DSv4 Flash TP1/EP1 routing
+    # contract. Maps to FLASHINFER_SM12X_NVFP4_VALIDATE_TOPK_IDS at runner init;
+    # metadata checks remain enabled, and upstream accepts -1 padding routes.
+    SGLANG_SM12X_NVFP4_VALIDATE_EXPERT_IDS = EnvBool(True)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)

@@ -41,6 +41,31 @@ def handle_moe_kernel_config(server_args: Any):
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
     view = resolved_view(server_args)
+    if view.moe_runner_backend == "flashinfer_sm12x_nvfp4":
+        if not get_platform().is_sm120:
+            raise ValueError(f"{view.moe_runner_backend} requires an SM120-family GPU.")
+        if view.ep_size != 1 or cfg.tp_size != 1 or view.moe_a2a_backend != "none":
+            raise ValueError(
+                f"Experimental {view.moe_runner_backend} requires TP=1, EP=1, "
+                "and --moe-a2a-backend none; pipeline parallelism is supported."
+            )
+        if not (
+            view.quantization in ("modelopt_fp4", "modelopt_mixed")
+            or model_config_of(server_args).nvfp4_moe_meta is not None
+        ):
+            raise ValueError(
+                f"{view.moe_runner_backend} requires serialized NVFP4 MoE weights."
+            )
+        if (
+            cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+            or cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "flashinfer_sm12x_nvfp4 currently requires --disable-cuda-graph: "
+                "end-to-end capture/replay of this experimental adapter has not "
+                "been validated, even with top-k range checking disabled."
+            )
+
     if view.moe_runner_backend == "flashinfer_cutlass":
         assert view.quantization in [
             "modelopt_fp4",

@@ -2544,7 +2544,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
-            up_first = self.enable_flashinfer_trtllm_moe
+            up_first = (
+                self.enable_flashinfer_trtllm_moe
+                or get_moe_runner_backend().is_flashinfer_sm12x_nvfp4()
+            )
             layer.w13_weight.data = deinterleave_w13(
                 layer.w13_weight.data, up_first=up_first
             )
@@ -2558,6 +2561,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        if moe_runner_backend.is_flashinfer_sm12x_nvfp4():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_sm12x_nvfp4 import (
+                prepare_unified_nvfp4_weights,
+            )
+
+            prepare_unified_nvfp4_weights(layer)
+            return
+
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -2903,7 +2914,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
         # The CuteDSL v1 (deepep) path uses [Gate, Up] -- do NOT flip.
         return self.moe_runner_config.is_gated and (
-            self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard
+            self.enable_flashinfer_cutlass_moe
+            or self._is_cutedsl_v2_standard
+            or get_moe_runner_backend().is_flashinfer_sm12x_nvfp4()
         )
 
     def create_moe_runner(
@@ -2921,6 +2934,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
 
         self._moe_runner_backend = moe_runner_backend
+
+        if moe_runner_backend.is_flashinfer_sm12x_nvfp4():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_sm12x_nvfp4 import (
+                validate_unified_nvfp4_config,
+            )
+
+            validate_unified_nvfp4_config(moe_runner_config)
+            layer._sm12x_nvfp4_layer = None
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
@@ -2985,6 +3006,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
         ), f"{activation=} is unsupported by {moe_runner_backend}"
         moe_runner_config = self.moe_runner_config
+
+        if moe_runner_backend.is_flashinfer_sm12x_nvfp4():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_sm12x_nvfp4 import (
+                UnifiedNvfp4MoeQuantInfo,
+            )
+
+            return self.runner.run(dispatch_output, UnifiedNvfp4MoeQuantInfo(layer))
 
         if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
